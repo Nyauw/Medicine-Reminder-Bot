@@ -3,10 +3,37 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum Language {
+    Chinese,
+    English,
+}
+
+impl Default for Language {
+    fn default() -> Self {
+        Language::Chinese
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserSettings {
+    pub language: Language,
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            language: Language::Chinese,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppData {
     pub medicines: MedicineStore,
     pub pending_reminders: PendingReminders,
+    #[serde(default)]
+    pub user_settings: UserSettings,
 }
 
 impl Default for AppData {
@@ -14,6 +41,7 @@ impl Default for AppData {
         Self {
             medicines: MedicineStore::new(),
             pending_reminders: PendingReminders::new(),
+            user_settings: UserSettings::default(),
         }
     }
 }

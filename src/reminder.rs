@@ -1,4 +1,4 @@
-use crate::{AppData, PendingReminder, Storage};
+use crate::{localization, AppData, PendingReminder, Storage};
 use chrono::{Duration, Local, NaiveTime};
 use std::sync::Arc;
 use teloxide::{prelude::*, types::ChatId};
@@ -130,19 +130,23 @@ impl ReminderService {
     }
 
     async fn send_reminder_message(&self, reminder: &PendingReminder) {
-        let message = format!(
-            "🔔 吃药提醒！\n\n💊 药品：{}\n⏰ 时间：{}\n\n请点击下面的按钮确认已服药：",
-            reminder.medicine_name,
-            reminder.scheduled_time.format("%H:%M")
+        let data = self.data.lock().await;
+        let language = &data.user_settings.language;
+        let text = localization::get_text(language);
+
+        let message = localization::format_reminder_message(
+            language,
+            &reminder.medicine_name,
+            &reminder.scheduled_time.format("%H:%M").to_string()
         );
 
         let keyboard = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
             teloxide::types::InlineKeyboardButton::callback(
-                "✅ 已服药",
+                text.taken_button,
                 format!("confirm_{}", reminder.id),
             ),
             teloxide::types::InlineKeyboardButton::callback(
-                "⏰ 稍后提醒",
+                text.snooze_button,
                 format!("snooze_{}", reminder.id),
             ),
         ]]);
@@ -158,20 +162,29 @@ impl ReminderService {
     }
 
     async fn send_follow_up_reminder(&self, reminder: &PendingReminder) {
+        let data = self.data.lock().await;
+        let language = &data.user_settings.language;
+        let text = localization::get_text(language);
+
         let message = format!(
-            "🔔 再次提醒吃药！\n\n💊 药品：{}\n⏰ 原定时间：{}\n📊 提醒次数：{}\n\n请确认是否已服药：",
+            "🔔 {}！\n\n💊 {}：{}\n⏰ {}：{}\n📊 {}：{}\n\n{}：",
+            if matches!(language, crate::storage::Language::Chinese) { "再次提醒吃药" } else { "Medicine Reminder Again" },
+            if matches!(language, crate::storage::Language::Chinese) { "药品" } else { "Medicine" },
             reminder.medicine_name,
+            if matches!(language, crate::storage::Language::Chinese) { "原定时间" } else { "Scheduled time" },
             reminder.scheduled_time.format("%H:%M"),
-            reminder.reminder_count
+            if matches!(language, crate::storage::Language::Chinese) { "提醒次数" } else { "Reminder count" },
+            reminder.reminder_count,
+            if matches!(language, crate::storage::Language::Chinese) { "请确认是否已服药" } else { "Please confirm if you have taken the medicine" }
         );
 
         let keyboard = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
             teloxide::types::InlineKeyboardButton::callback(
-                "✅ 已服药",
+                text.taken_button,
                 format!("confirm_{}", reminder.id),
             ),
             teloxide::types::InlineKeyboardButton::callback(
-                "⏰ 稍后提醒",
+                text.snooze_button,
                 format!("snooze_{}", reminder.id),
             ),
         ]]);
@@ -221,6 +234,7 @@ impl ReminderService {
 
     pub async fn snooze_reminder(&self, reminder_id: Uuid) -> Result<String, String> {
         let mut data = self.data.lock().await;
+        let language = data.user_settings.language.clone();
 
         if let Some(reminder) = data.pending_reminders.get_mut(&reminder_id) {
             // 重置最后提醒时间，延迟5分钟后再次提醒
@@ -230,9 +244,19 @@ impl ReminderService {
                 log::error!("Failed to save data: {}", e);
             }
 
-            Ok("⏰ 已延迟提醒，5分钟后将再次提醒".to_string())
+            let response = if matches!(language, crate::storage::Language::Chinese) {
+                "⏰ 已延迟提醒，5分钟后将再次提醒"
+            } else {
+                "⏰ Reminder snoozed, will remind again in 5 minutes"
+            };
+            Ok(response.to_string())
         } else {
-            Err("提醒信息未找到".to_string())
+            let error_msg = if matches!(language, crate::storage::Language::Chinese) {
+                "提醒信息未找到"
+            } else {
+                "Reminder information not found"
+            };
+            Err(error_msg.to_string())
         }
     }
 
@@ -253,6 +277,8 @@ impl ReminderService {
 
     pub async fn confirm_medicine_with_amount(&self, reminder_id: Uuid, amount: u32) -> Result<String, String> {
         let mut data = self.data.lock().await;
+        let language = data.user_settings.language.clone();
+        let text = localization::get_text(&language);
 
         if let Some(reminder) = data.pending_reminders.get_mut(&reminder_id) {
             reminder.confirm();
@@ -263,9 +289,12 @@ impl ReminderService {
             if let Some(medicine) = data.medicines.get_mut(&medicine_id) {
                 if medicine.take_dose(amount) {
                     let response = format!(
-                        "✅ 已确认服药：{}\n💊 服用数量：{}\n📦 剩余数量：{}",
+                        "{}: {}\n💊 {}: {}\n📦 {}: {}",
+                        text.dose_confirmed.trim_end_matches("✅ "),
                         medicine_name,
+                        if matches!(language, crate::storage::Language::Chinese) { "服用数量" } else { "Dose amount" },
                         amount,
+                        if matches!(language, crate::storage::Language::Chinese) { "剩余数量" } else { "Remaining" },
                         medicine.quantity
                     );
 
@@ -275,13 +304,28 @@ impl ReminderService {
 
                     Ok(response)
                 } else {
-                    Err(format!("药品数量不足，当前剩余：{}", medicine.quantity))
+                    let error_msg = if matches!(language, crate::storage::Language::Chinese) {
+                        format!("药品数量不足，当前剩余：{}", medicine.quantity)
+                    } else {
+                        format!("Insufficient quantity, remaining: {}", medicine.quantity)
+                    };
+                    Err(error_msg)
                 }
             } else {
-                Err("药品信息未找到".to_string())
+                let error_msg = if matches!(language, crate::storage::Language::Chinese) {
+                    "药品信息未找到"
+                } else {
+                    "Medicine information not found"
+                };
+                Err(error_msg.to_string())
             }
         } else {
-            Err("提醒信息未找到".to_string())
+            let error_msg = if matches!(language, crate::storage::Language::Chinese) {
+                "提醒信息未找到"
+            } else {
+                "Reminder information not found"
+            };
+            Err(error_msg.to_string())
         }
     }
 }

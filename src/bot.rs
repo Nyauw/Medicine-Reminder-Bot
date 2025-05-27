@@ -1,4 +1,4 @@
-use crate::{Medicine, ReminderService};
+use crate::{localization, storage::Language, Medicine, ReminderService};
 use chrono::NaiveTime;
 use std::sync::Arc;
 use teloxide::{
@@ -38,6 +38,8 @@ pub enum Command {
     Refill,
     #[command(description = "查看待确认的提醒")]
     Pending,
+    #[command(description = "切换语言")]
+    Language,
 }
 
 pub fn schema() -> UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -51,7 +53,8 @@ pub fn schema() -> UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'stat
                 .branch(case![Command::List].endpoint(list_medicines))
                 .branch(case![Command::Delete].endpoint(delete_medicine))
                 .branch(case![Command::Refill].endpoint(refill_medicine))
-                .branch(case![Command::Pending].endpoint(show_pending)),
+                .branch(case![Command::Pending].endpoint(show_pending))
+                .branch(case![Command::Language].endpoint(show_language_selection)),
         )
         .branch(case![State::ReceiveMedicineName].endpoint(receive_medicine_name))
         .branch(case![State::ReceiveQuantity { name }].endpoint(receive_quantity))
@@ -77,36 +80,65 @@ pub fn schema() -> UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'stat
         .branch(callback_query_handler)
 }
 
-async fn help(bot: Bot, msg: Message) -> HandlerResult {
-    let help_text = "🏥 药品提醒助手\n\n\
-        📋 可用命令：\n\
-        /add - 添加新药品\n\
-        /list - 查看所有药品\n\
-        /delete - 删除药品\n\
-        /refill - 补充药品数量\n\
-        /pending - 查看待确认的提醒\n\
-        /help - 显示此帮助信息\n\n\
-        💡 使用说明：\n\
-        1. 使用 /add 添加药品，设置名称、数量和提醒时间\n\
-        2. 系统会在设定时间自动提醒\n\
-        3. 收到提醒后请点击确认按钮\n\
-        4. 如果不确认，系统会持续提醒";
+async fn help(bot: Bot, msg: Message, reminder_service: Arc<ReminderService>) -> HandlerResult {
+    let data = reminder_service.get_data().await;
+    let language = &data.user_settings.language;
+    let help_text = localization::format_help_message(language);
 
     bot.send_message(msg.chat.id, help_text).await?;
     Ok(())
 }
 
-async fn start_add_medicine(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
-    bot.send_message(msg.chat.id, "请输入药品名称：").await?;
+async fn show_language_selection(bot: Bot, msg: Message, reminder_service: Arc<ReminderService>) -> HandlerResult {
+    let data = reminder_service.get_data().await;
+    let language = &data.user_settings.language;
+    let text = localization::get_text(language);
+
+    let keyboard = vec![
+        vec![
+            InlineKeyboardButton::callback(text.chinese_button, "lang_chinese"),
+            InlineKeyboardButton::callback(text.english_button, "lang_english"),
+        ],
+    ];
+    let markup = InlineKeyboardMarkup::new(keyboard);
+
+    let current_lang = if matches!(language, Language::Chinese) {
+        "当前语言：中文"
+    } else {
+        "Current language: English"
+    };
+
+    let message = format!("{}\n\n{}", current_lang, text.select_language);
+
+    bot.send_message(msg.chat.id, message)
+        .reply_markup(markup)
+        .await?;
+    Ok(())
+}
+
+async fn start_add_medicine(bot: Bot, dialogue: MyDialogue, msg: Message, reminder_service: Arc<ReminderService>) -> HandlerResult {
+    let data = reminder_service.get_data().await;
+    let language = &data.user_settings.language;
+    let text = localization::get_text(language);
+
+    bot.send_message(msg.chat.id, text.enter_medicine_name).await?;
     dialogue.update(State::ReceiveMedicineName).await?;
     Ok(())
 }
 
-async fn receive_medicine_name(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
+async fn receive_medicine_name(bot: Bot, dialogue: MyDialogue, msg: Message, reminder_service: Arc<ReminderService>) -> HandlerResult {
+    let data = reminder_service.get_data().await;
+    let language = &data.user_settings.language;
+    let text = localization::get_text(language);
+
     match msg.text() {
         Some(name) => {
-            bot.send_message(msg.chat.id, format!("药品名称：{}\n请输入药品数量：", name))
-                .await?;
+            let message = format!("{}：{}\n{}",
+                if matches!(language, Language::Chinese) { "药品名称" } else { "Medicine name" },
+                name,
+                text.enter_quantity
+            );
+            bot.send_message(msg.chat.id, message).await?;
             dialogue
                 .update(State::ReceiveQuantity {
                     name: name.to_string(),
@@ -114,7 +146,7 @@ async fn receive_medicine_name(bot: Bot, dialogue: MyDialogue, msg: Message) -> 
                 .await?;
         }
         None => {
-            bot.send_message(msg.chat.id, "请输入有效的药品名称").await?;
+            bot.send_message(msg.chat.id, text.enter_medicine_name).await?;
         }
     }
     Ok(())
@@ -125,23 +157,29 @@ async fn receive_quantity(
     dialogue: MyDialogue,
     msg: Message,
     name: String,
+    reminder_service: Arc<ReminderService>,
 ) -> HandlerResult {
+    let data = reminder_service.get_data().await;
+    let language = &data.user_settings.language;
+    let text = localization::get_text(language);
+
     match msg.text().and_then(|text| text.parse::<u32>().ok()) {
         Some(quantity) => {
-            bot.send_message(
-                msg.chat.id,
-                format!(
-                    "药品：{}\n数量：{}\n\n请输入提醒时间（格式：HH:MM，多个时间用逗号分隔）\n例如：08:00,20:00",
-                    name, quantity
-                ),
-            )
-            .await?;
+            let message = format!(
+                "{}：{}\n{}：{}\n\n{}",
+                if matches!(language, Language::Chinese) { "药品" } else { "Medicine" },
+                name,
+                if matches!(language, Language::Chinese) { "数量" } else { "Quantity" },
+                quantity,
+                text.enter_reminder_times
+            );
+            bot.send_message(msg.chat.id, message).await?;
             dialogue
                 .update(State::ReceiveReminderTimes { name, quantity })
                 .await?;
         }
         None => {
-            bot.send_message(msg.chat.id, "请输入有效的数量（正整数）").await?;
+            bot.send_message(msg.chat.id, text.invalid_quantity).await?;
         }
     }
     Ok(())
@@ -164,6 +202,10 @@ async fn receive_reminder_times(
 
             match times {
                 Ok(reminder_times) if !reminder_times.is_empty() => {
+                    let data = reminder_service.get_data().await;
+                    let language = &data.user_settings.language;
+                    let text = localization::get_text(language);
+
                     let medicine = Medicine::new(name.clone(), quantity, reminder_times.clone());
 
                     if let Err(e) = reminder_service
@@ -172,7 +214,12 @@ async fn receive_reminder_times(
                         })
                         .await {
                         log::error!("Failed to save medicine: {}", e);
-                        bot.send_message(msg.chat.id, "❌ 保存药品信息失败").await?;
+                        let error_msg = if matches!(language, Language::Chinese) {
+                            "❌ 保存药品信息失败"
+                        } else {
+                            "❌ Failed to save medicine information"
+                        };
+                        bot.send_message(msg.chat.id, error_msg).await?;
                         return Ok(());
                     }
 
@@ -181,25 +228,25 @@ async fn receive_reminder_times(
                         .map(|t| t.format("%H:%M").to_string())
                         .collect();
 
-                    bot.send_message(
-                        msg.chat.id,
-                        format!(
-                            "✅ 药品添加成功！\n\n💊 名称：{}\n📦 数量：{}\n⏰ 提醒时间：{}",
-                            name,
-                            quantity,
-                            times_display.join(", ")
-                        ),
-                    )
-                    .await?;
+                    let message = format!(
+                        "{}\n\n💊 {}：{}\n📦 {}：{}\n⏰ {}：{}",
+                        text.medicine_added,
+                        if matches!(language, Language::Chinese) { "名称" } else { "Name" },
+                        name,
+                        if matches!(language, Language::Chinese) { "数量" } else { "Quantity" },
+                        quantity,
+                        if matches!(language, Language::Chinese) { "提醒时间" } else { "Reminder times" },
+                        times_display.join(", ")
+                    );
 
+                    bot.send_message(msg.chat.id, message).await?;
                     dialogue.update(State::Start).await?;
                 }
                 _ => {
-                    bot.send_message(
-                        msg.chat.id,
-                        "时间格式错误，请使用 HH:MM 格式，多个时间用逗号分隔\n例如：08:00,20:00",
-                    )
-                    .await?;
+                    let data = reminder_service.get_data().await;
+                    let language = &data.user_settings.language;
+                    let text = localization::get_text(language);
+                    bot.send_message(msg.chat.id, text.invalid_time_format).await?;
                 }
             }
         }
@@ -212,13 +259,15 @@ async fn receive_reminder_times(
 
 async fn list_medicines(bot: Bot, msg: Message, reminder_service: Arc<ReminderService>) -> HandlerResult {
     let data = reminder_service.get_data().await;
+    let language = &data.user_settings.language;
+    let text = localization::get_text(language);
 
     if data.medicines.is_empty() {
-        bot.send_message(msg.chat.id, "📭 暂无药品记录").await?;
+        bot.send_message(msg.chat.id, text.no_medicines).await?;
         return Ok(());
     }
 
-    let mut message = "💊 药品列表：\n\n".to_string();
+    let mut message = format!("{}\n\n", text.medicines_list);
     for (i, medicine) in data.medicines.values().enumerate() {
         let status = if medicine.is_active { "🟢" } else { "🔴" };
         let times: Vec<String> = medicine
@@ -228,11 +277,13 @@ async fn list_medicines(bot: Bot, msg: Message, reminder_service: Arc<ReminderSe
             .collect();
 
         message.push_str(&format!(
-            "{}. {} {}\n📦 数量：{}\n⏰ 提醒时间：{}\n\n",
+            "{}. {} {}\n📦 {}：{}\n⏰ {}：{}\n\n",
             i + 1,
             status,
             medicine.name,
+            if matches!(language, Language::Chinese) { "数量" } else { "Quantity" },
             medicine.quantity,
+            if matches!(language, Language::Chinese) { "提醒时间" } else { "Reminder times" },
             times.join(", ")
         ));
     }
@@ -243,9 +294,16 @@ async fn list_medicines(bot: Bot, msg: Message, reminder_service: Arc<ReminderSe
 
 async fn delete_medicine(bot: Bot, msg: Message, reminder_service: Arc<ReminderService>) -> HandlerResult {
     let data = reminder_service.get_data().await;
+    let language = &data.user_settings.language;
+    let text = localization::get_text(language);
 
     if data.medicines.is_empty() {
-        bot.send_message(msg.chat.id, "📭 暂无药品可删除").await?;
+        let no_medicines_msg = if matches!(language, Language::Chinese) {
+            "📭 暂无药品可删除"
+        } else {
+            "📭 No medicines to delete"
+        };
+        bot.send_message(msg.chat.id, no_medicines_msg).await?;
         return Ok(());
     }
 
@@ -258,7 +316,7 @@ async fn delete_medicine(bot: Bot, msg: Message, reminder_service: Arc<ReminderS
     }
 
     let markup = InlineKeyboardMarkup::new(keyboard);
-    bot.send_message(msg.chat.id, "请选择要删除的药品：")
+    bot.send_message(msg.chat.id, text.select_medicine_to_delete)
         .reply_markup(markup)
         .await?;
     Ok(())
@@ -266,22 +324,34 @@ async fn delete_medicine(bot: Bot, msg: Message, reminder_service: Arc<ReminderS
 
 async fn refill_medicine(bot: Bot, msg: Message, reminder_service: Arc<ReminderService>) -> HandlerResult {
     let data = reminder_service.get_data().await;
+    let language = &data.user_settings.language;
+    let text = localization::get_text(language);
 
     if data.medicines.is_empty() {
-        bot.send_message(msg.chat.id, "📭 暂无药品可补充").await?;
+        let no_medicines_msg = if matches!(language, Language::Chinese) {
+            "📭 暂无药品可补充"
+        } else {
+            "📭 No medicines to refill"
+        };
+        bot.send_message(msg.chat.id, no_medicines_msg).await?;
         return Ok(());
     }
 
     let mut keyboard = Vec::new();
     for medicine in data.medicines.values() {
+        let remaining_text = if matches!(language, Language::Chinese) {
+            format!("💊 {} (剩余: {})", medicine.name, medicine.quantity)
+        } else {
+            format!("💊 {} (remaining: {})", medicine.name, medicine.quantity)
+        };
         keyboard.push(vec![InlineKeyboardButton::callback(
-            format!("💊 {} (剩余: {})", medicine.name, medicine.quantity),
+            remaining_text,
             format!("refill_{}", medicine.id),
         )]);
     }
 
     let markup = InlineKeyboardMarkup::new(keyboard);
-    bot.send_message(msg.chat.id, "请选择要补充的药品：")
+    bot.send_message(msg.chat.id, text.select_medicine_to_refill)
         .reply_markup(markup)
         .await?;
     Ok(())
@@ -289,6 +359,8 @@ async fn refill_medicine(bot: Bot, msg: Message, reminder_service: Arc<ReminderS
 
 async fn show_pending(bot: Bot, msg: Message, reminder_service: Arc<ReminderService>) -> HandlerResult {
     let data = reminder_service.get_data().await;
+    let language = &data.user_settings.language;
+    let text = localization::get_text(language);
 
     let pending: Vec<_> = data
         .pending_reminders
@@ -297,17 +369,19 @@ async fn show_pending(bot: Bot, msg: Message, reminder_service: Arc<ReminderServ
         .collect();
 
     if pending.is_empty() {
-        bot.send_message(msg.chat.id, "✅ 暂无待确认的提醒").await?;
+        bot.send_message(msg.chat.id, text.no_pending_reminders).await?;
         return Ok(());
     }
 
-    let mut message = "⏰ 待确认的提醒：\n\n".to_string();
+    let mut message = format!("{}\n\n", text.pending_reminders_title);
     for (i, reminder) in pending.iter().enumerate() {
         message.push_str(&format!(
-            "{}. 💊 {}\n⏰ 时间：{}\n📊 提醒次数：{}\n\n",
+            "{}. 💊 {}\n⏰ {}：{}\n📊 {}：{}\n\n",
             i + 1,
             reminder.medicine_name,
+            if matches!(language, Language::Chinese) { "时间" } else { "Time" },
             reminder.scheduled_time.format("%H:%M"),
+            if matches!(language, Language::Chinese) { "提醒次数" } else { "Reminder count" },
             reminder.reminder_count
         ));
     }
@@ -320,22 +394,55 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, reminder_service: Arc<Remin
     if let Some(data) = &q.data {
 
         if let Some(chat_id) = q.message.as_ref().map(|m| m.chat.id) {
-            if data.starts_with("confirm_") {
+            if data.starts_with("lang_") {
+                let new_language = if data == "lang_chinese" {
+                    Language::Chinese
+                } else if data == "lang_english" {
+                    Language::English
+                } else {
+                    return Ok(());
+                };
+
+                if let Err(e) = reminder_service
+                    .update_data(|app_data| {
+                        app_data.user_settings.language = new_language.clone();
+                    })
+                    .await {
+                    log::error!("Failed to update language: {}", e);
+                    bot.send_message(chat_id, "❌ Failed to update language / 更新语言失败").await?;
+                } else {
+                    let text = localization::get_text(&new_language);
+                    bot.send_message(chat_id, text.language_changed).await?;
+                }
+            } else if data.starts_with("confirm_") {
                 let reminder_id = data.strip_prefix("confirm_").unwrap();
                 if let Ok(_uuid) = Uuid::parse_str(reminder_id) {
+                    let current_data = reminder_service.get_data().await;
+                    let language = &current_data.user_settings.language;
+                    let text = localization::get_text(language);
+
                     // 显示数量选择界面
                     let keyboard = vec![
                         vec![
-                            InlineKeyboardButton::callback("1片", format!("dose_1_{}", reminder_id)),
-                            InlineKeyboardButton::callback("2片", format!("dose_2_{}", reminder_id)),
-                            InlineKeyboardButton::callback("3片", format!("dose_3_{}", reminder_id)),
+                            InlineKeyboardButton::callback(
+                                format!("1{}", text.pills_unit),
+                                format!("dose_1_{}", reminder_id)
+                            ),
+                            InlineKeyboardButton::callback(
+                                format!("2{}", text.pills_unit),
+                                format!("dose_2_{}", reminder_id)
+                            ),
+                            InlineKeyboardButton::callback(
+                                format!("3{}", text.pills_unit),
+                                format!("dose_3_{}", reminder_id)
+                            ),
                         ],
                         vec![
-                            InlineKeyboardButton::callback("自定义数量", format!("dose_custom_{}", reminder_id)),
+                            InlineKeyboardButton::callback(text.custom_amount_button, format!("dose_custom_{}", reminder_id)),
                         ],
                     ];
                     let markup = InlineKeyboardMarkup::new(keyboard);
-                    bot.send_message(chat_id, "请选择服用数量：")
+                    bot.send_message(chat_id, text.select_dose_amount)
                         .reply_markup(markup)
                         .await?;
                 }
@@ -368,19 +475,32 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, reminder_service: Arc<Remin
             } else if data.starts_with("refill_") {
                 let medicine_id = data.strip_prefix("refill_").unwrap();
                 if let Ok(_uuid) = Uuid::parse_str(medicine_id) {
+                    let current_data = reminder_service.get_data().await;
+                    let language = &current_data.user_settings.language;
+                    let text = localization::get_text(language);
+
                     // 显示数量选择界面
                     let keyboard = vec![
                         vec![
-                            InlineKeyboardButton::callback("10个", format!("refill_10_{}", medicine_id)),
-                            InlineKeyboardButton::callback("20个", format!("refill_20_{}", medicine_id)),
-                            InlineKeyboardButton::callback("30个", format!("refill_30_{}", medicine_id)),
+                            InlineKeyboardButton::callback(
+                                format!("10{}", text.pieces_unit),
+                                format!("refill_10_{}", medicine_id)
+                            ),
+                            InlineKeyboardButton::callback(
+                                format!("20{}", text.pieces_unit),
+                                format!("refill_20_{}", medicine_id)
+                            ),
+                            InlineKeyboardButton::callback(
+                                format!("30{}", text.pieces_unit),
+                                format!("refill_30_{}", medicine_id)
+                            ),
                         ],
                         vec![
-                            InlineKeyboardButton::callback("自定义数量", format!("refill_custom_{}", medicine_id)),
+                            InlineKeyboardButton::callback(text.custom_amount_button, format!("refill_custom_{}", medicine_id)),
                         ],
                     ];
                     let markup = InlineKeyboardMarkup::new(keyboard);
-                    bot.send_message(chat_id, "请选择补充数量：")
+                    bot.send_message(chat_id, text.enter_refill_amount)
                         .reply_markup(markup)
                         .await?;
                 }
@@ -388,7 +508,11 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, reminder_service: Arc<Remin
                 // 处理服药数量选择
                 if data.starts_with("dose_custom_") {
                     let reminder_id = data.strip_prefix("dose_custom_").unwrap();
-                    bot.send_message(chat_id, "请输入服用数量：").await?;
+                    let current_data = reminder_service.get_data().await;
+                    let language = &current_data.user_settings.language;
+                    let text = localization::get_text(language);
+
+                    bot.send_message(chat_id, text.enter_custom_amount).await?;
                     dialogue.update(State::ReceiveConfirmDoseAmount {
                         reminder_id: reminder_id.to_string()
                     }).await?;
@@ -412,7 +536,11 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, reminder_service: Arc<Remin
                 // 处理补充数量选择
                 if data.starts_with("refill_custom_") {
                     let medicine_id = data.strip_prefix("refill_custom_").unwrap();
-                    bot.send_message(chat_id, "请输入补充数量：").await?;
+                    let current_data = reminder_service.get_data().await;
+                    let language = &current_data.user_settings.language;
+                    let text = localization::get_text(language);
+
+                    bot.send_message(chat_id, text.enter_refill_amount).await?;
                     dialogue.update(State::ReceiveRefillAmount {
                         medicine_id: medicine_id.to_string()
                     }).await?;

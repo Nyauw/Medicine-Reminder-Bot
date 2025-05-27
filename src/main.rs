@@ -44,8 +44,12 @@ async fn main() {
     });
 
     // 发送启动消息
+    let startup_data = reminder_service.get_data().await;
+    let startup_language = &startup_data.user_settings.language;
+    let startup_text = medicine_reminder::localization::get_text(startup_language);
+
     if let Err(e) = bot
-        .send_message(chat_id, "🤖 药品提醒机器人已启动！\n\n使用 /help 查看可用命令。")
+        .send_message(chat_id, startup_text.startup_message)
         .await
     {
         log::error!("发送启动消息失败: {}", e);
