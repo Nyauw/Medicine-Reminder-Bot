@@ -1,9 +1,10 @@
 use crate::{localization, AppData, PendingReminder, Storage};
 use chrono::{Duration, Local, NaiveTime};
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use teloxide::{prelude::*, types::ChatId};
 use tokio::sync::Mutex;
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use uuid::Uuid;
 
 pub struct ReminderService {
@@ -24,13 +25,40 @@ impl ReminderService {
         }
     }
 
-    pub async fn start_reminder_loop(&self) {
+    pub async fn start_reminder_loop(&self) -> anyhow::Result<()> {
         let mut interval = interval(tokio::time::Duration::from_secs(60)); // 每分钟检查一次
+        let mut error_count = 0;
+        const MAX_ERRORS: u32 = 10;
 
         loop {
             interval.tick().await;
-            self.check_and_send_reminders().await;
-            self.check_pending_reminders().await;
+
+            // 检查和发送提醒，带超时和错误处理
+            if let Err(e) = timeout(
+                StdDuration::from_secs(30),
+                self.check_and_send_reminders()
+            ).await {
+                log::error!("检查提醒超时: {:?}", e);
+                error_count += 1;
+            } else {
+                error_count = 0; // 重置错误计数
+            }
+
+            // 检查待确认提醒，带超时和错误处理
+            if let Err(e) = timeout(
+                StdDuration::from_secs(30),
+                self.check_pending_reminders()
+            ).await {
+                log::error!("检查待确认提醒超时: {:?}", e);
+                error_count += 1;
+            }
+
+            // 如果连续错误太多，暂停一段时间
+            if error_count >= MAX_ERRORS {
+                log::warn!("连续错误过多，暂停5分钟...");
+                tokio::time::sleep(StdDuration::from_secs(300)).await;
+                error_count = 0;
+            }
         }
     }
 
@@ -151,14 +179,8 @@ impl ReminderService {
             ),
         ]]);
 
-        if let Err(e) = self
-            .bot
-            .send_message(self.chat_id, message)
-            .reply_markup(keyboard)
-            .await
-        {
-            log::error!("Failed to send reminder message: {}", e);
-        }
+        // 带超时和重试的发送消息
+        self.send_message_with_retry(message, Some(keyboard), 3).await;
     }
 
     async fn send_follow_up_reminder(&self, reminder: &PendingReminder) {
@@ -189,14 +211,47 @@ impl ReminderService {
             ),
         ]]);
 
-        if let Err(e) = self
-            .bot
-            .send_message(self.chat_id, message)
-            .reply_markup(keyboard)
-            .await
-        {
-            log::error!("Failed to send follow-up reminder: {}", e);
+        // 带超时和重试的发送消息
+        self.send_message_with_retry(message, Some(keyboard), 3).await;
+    }
+
+    // 新增：带重试机制的消息发送方法
+    async fn send_message_with_retry(
+        &self,
+        message: String,
+        keyboard: Option<teloxide::types::InlineKeyboardMarkup>,
+        max_retries: u32,
+    ) {
+        for attempt in 1..=max_retries {
+            let send_future = async {
+                let mut request = self.bot.send_message(self.chat_id, &message);
+                if let Some(ref kb) = keyboard {
+                    request = request.reply_markup(kb.clone());
+                }
+                request.await
+            };
+
+            match timeout(StdDuration::from_secs(10), send_future).await {
+                Ok(Ok(_)) => {
+                    log::debug!("消息发送成功");
+                    return;
+                }
+                Ok(Err(e)) => {
+                    log::warn!("发送消息失败 (尝试 {}/{}): {}", attempt, max_retries, e);
+                }
+                Err(_) => {
+                    log::warn!("发送消息超时 (尝试 {}/{})", attempt, max_retries);
+                }
+            }
+
+            if attempt < max_retries {
+                // 指数退避：1秒、2秒、4秒...
+                let delay = StdDuration::from_secs(2_u64.pow(attempt - 1));
+                tokio::time::sleep(delay).await;
+            }
         }
+
+        log::error!("发送消息最终失败，已重试 {} 次", max_retries);
     }
 
     pub async fn confirm_medicine(&self, reminder_id: Uuid) -> Result<String, String> {
